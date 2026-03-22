@@ -10,16 +10,13 @@ import (
 var spec Specification
 
 type Specification struct {
-	TwilioAuth      string
-	TwilioAccSid    string
-	OpenaiApiKey    string
-	JwtSecret       string
-	TwilioPhoneNum  string
-	MongoSecret     string
-	TwilioSecret    string
-	TwilioApiKey    string	
-	TwilioApiSecret string
-	AppWebhookUrl   string
+	TwilioAuth     string
+	TwilioAccSid   string
+	AnthropicApiKey string
+	TwilioPhoneNum string
+	AppWebhookUrl  string
+	JwtSecret      string // kept for utils package compatibility
+	MongoSecret    string // kept for db package compatibility
 }
 
 func New() *Specification {
@@ -28,14 +25,11 @@ func New() *Specification {
 	spec = Specification{
 		TwilioAuth:     getEnvVar("TWILIO_AUTH"),
 		TwilioAccSid:   getEnvVar("TWILIO_ACC_SID"),
-		OpenaiApiKey:   getEnvVar("OPENAI_API_KEY"),
-		JwtSecret:      getEnvVar("JWT_SECRET"),
+		AnthropicApiKey: getEnvVar("ANTHROPIC_API_KEY"),
 		TwilioPhoneNum: getEnvVar("TWILIO_PHONE_NUM"),
-		MongoSecret:    getEnvVar("MONGODB_URI"),
-		TwilioSecret:   getEnvVar("TWILIO_SECRET"),
-		TwilioApiKey:   getEnvVar("TWILIO_API_KEY"),
-		TwilioApiSecret: getEnvVar("TWILIO_API_SECRET"),
 		AppWebhookUrl:  getEnvVar("APP_WEBHOOK_URL"),
+		JwtSecret:      os.Getenv("JWT_SECRET"),   // optional
+		MongoSecret:    os.Getenv("MONGODB_URI"),  // optional
 	}
 	return &spec
 }
@@ -45,6 +39,5 @@ func getEnvVar(varName string) string {
 	if envVar == "" {
 		log.Panicln(varName, " environment variable is not set.")
 	}
-
 	return envVar
 }
