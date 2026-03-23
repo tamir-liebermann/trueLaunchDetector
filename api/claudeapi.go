@@ -22,6 +22,7 @@ const (
 	TRANSLATE_INTENT      = "translate"
 	HELP_INTENT           = "help"
 	CHAT_INTENT           = "chat"
+	SUMMARY_INTENT        = "summary"
 )
 
 var systemPrompt = `You are an Israeli missile/rocket alert chatbot. Users talk to you via WhatsApp.
@@ -51,6 +52,9 @@ translate → user wants the last alert translated to English
 
 help → user asks for help or list of commands
 {"intent":"help"}
+
+summary → user wants a summary or overview of what happened in the last 12 hours / today / recently
+{"intent":"summary"}
 
 chat → user is asking a question or having a conversation about missile alerts, rocket attacks, the security situation in Israel, shelters, safe rooms, Home Front Command instructions, or related geopolitical topics
 {"intent":"chat","body":{"message":"<the original user message>"}}
@@ -149,6 +153,9 @@ func (api *ApiManager) handleAlertIntent(req GenericRequest, phone string) strin
 	case HELP_INTENT:
 		return helpMessage()
 
+	case SUMMARY_INTENT:
+		return api.buildSituationSummary()
+
 	case CHAT_INTENT:
 		msg, _ := req.Body["message"].(string)
 		if msg == "" {
@@ -195,6 +202,29 @@ func (api *ApiManager) formatRecentAlertsForUser(phone string) string {
 	return sb.String()
 }
 
+func (api *ApiManager) buildSituationSummary() string {
+	alerts := api.poller.History()
+	if len(alerts) == 0 {
+		return "✅ No alerts recorded in the last 12 hours since the server started."
+	}
+
+	var sb strings.Builder
+	for _, a := range alerts {
+		sb.WriteString(fmt.Sprintf("%s — areas: %s\n", a.Title, strings.Join(a.Data, ", ")))
+	}
+
+	prompt := fmt.Sprintf(
+		"Here are %d missile/rocket alerts recorded in Israel in the last 12 hours:\n\n%s\nWrite a concise situation summary (4-6 sentences). Include: total alerts, most affected areas, threat types, overall picture. Plain text only.",
+		len(alerts), sb.String(),
+	)
+
+	summary, err := claudeComplete(chatSystemPrompt, prompt)
+	if err != nil {
+		return "Sorry, couldn't generate a summary right now."
+	}
+	return fmt.Sprintf("📊 *Situation Summary — Last 12 Hours*\n\n%s", summary)
+}
+
 func (api *ApiManager) translateLastAlertForUser() string {
 	alerts := api.poller.RecentAlerts()
 	if len(alerts) == 0 {
@@ -214,7 +244,8 @@ func helpMessage() string {
 • *my location is <city>* – Prioritize alerts for your area 🚨
 • *switch to English / עברית* – Change alert language
 • *any alerts?* – See recent alerts
-• *translate* – Translate last alert to English`
+• *translate* – Translate last alert to English
+• *summary* / *what happened today?* – Situation summary for the last 12 hours`
 }
 
 func min(a, b int) int {

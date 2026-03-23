@@ -14,12 +14,19 @@ const (
 	orefAlertsURL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
 	pollInterval  = 2 * time.Second
 	dedupTTL      = 10 * time.Minute
+	summaryWindow = 12 * time.Hour
 )
 
+type timedAlert struct {
+	alert OrefAlert
+	seenAt time.Time
+}
+
 type AlertPoller struct {
-	mu          sync.Mutex
-	seen        map[string]time.Time
-	lastAlerts  []OrefAlert
+	mu         sync.Mutex
+	seen       map[string]time.Time
+	lastAlerts []OrefAlert
+	history    []timedAlert
 }
 
 func NewAlertPoller() *AlertPoller {
@@ -111,6 +118,21 @@ func (p *AlertPoller) storeRecent(alert OrefAlert) {
 	if len(p.lastAlerts) > 20 {
 		p.lastAlerts = p.lastAlerts[:20]
 	}
+	p.history = append(p.history, timedAlert{alert: alert, seenAt: time.Now()})
+}
+
+// History returns all alerts seen in the last 12 hours.
+func (p *AlertPoller) History() []OrefAlert {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cutoff := time.Now().Add(-summaryWindow)
+	var result []OrefAlert
+	for _, ta := range p.history {
+		if ta.seenAt.After(cutoff) {
+			result = append(result, ta.alert)
+		}
+	}
+	return result
 }
 
 func (p *AlertPoller) cleanupSeen() {
