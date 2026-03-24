@@ -3,22 +3,31 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
+	"log"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const (
-	orefAlertsURL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
-	pollInterval  = 2 * time.Second
-	dedupTTL      = 10 * time.Minute
-	summaryWindow = 12 * time.Hour
+	tzevaadomWSURL = "wss://ws.tzevaadom.co.il/socket?platform=ANDROID"
+	summaryWindow  = 12 * time.Hour
+	reconnectDelay = 5 * time.Second
 )
 
+// tzevaadomMsg is the raw message format from the Tzevaadom WebSocket.
+type tzevaadomMsg struct {
+	Type   int      `json:"type"`
+	Time   string   `json:"time"`
+	Threat int      `json:"threat"`
+	Cities []string `json:"cities"`
+	IsDrill bool    `json:"isDrill"`
+}
+
 type timedAlert struct {
-	alert OrefAlert
+	alert  OrefAlert
 	seenAt time.Time
 }
 
@@ -34,68 +43,107 @@ func NewAlertPoller() *AlertPoller {
 }
 
 func (p *AlertPoller) Start(store *SubscriberStore, broadcast func(*Subscriber, OrefAlert)) {
-	pollTicker := time.NewTicker(pollInterval)
-	cleanupTicker := time.NewTicker(5 * time.Minute)
-	defer pollTicker.Stop()
-	defer cleanupTicker.Stop()
+	for {
+		if err := p.connect(store, broadcast); err != nil {
+			log.Printf("WebSocket disconnected: %v — reconnecting in %s", err, reconnectDelay)
+		}
+		time.Sleep(reconnectDelay)
+	}
+}
+
+func (p *AlertPoller) connect(store *SubscriberStore, broadcast func(*Subscriber, OrefAlert)) error {
+	dialer := websocket.DefaultDialer
+	conn, _, err := dialer.Dial(tzevaadomWSURL, nil)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	log.Println("Connected to Tzevaadom WebSocket")
+
+	// keepalive ping
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}()
 
 	for {
-		select {
-		case <-pollTicker.C:
-			alerts, err := p.fetchAlerts()
-			if err != nil {
-				continue
-			}
-			for _, alert := range alerts {
-				if p.isDuplicate(alert.ID) {
-					continue
-				}
-				p.markSeen(alert.ID)
-				p.storeRecent(alert)
-				for _, sub := range store.All() {
-					go broadcast(sub, alert)
-				}
-			}
-		case <-cleanupTicker.C:
-			p.cleanupSeen()
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+
+		var raw tzevaadomMsg
+		if err := json.Unmarshal(msg, &raw); err != nil {
+			continue // skip non-alert messages (e.g. pongs, system messages)
+		}
+
+		// type 0 = alert, isDrill = skip drills
+		if raw.Type != 0 || raw.IsDrill || len(raw.Cities) == 0 {
+			continue
+		}
+
+		alert := p.toOrefAlert(raw)
+		dedupKey := alert.ID
+		if p.isDuplicate(dedupKey) {
+			continue
+		}
+		p.markSeen(dedupKey)
+		p.storeRecent(alert)
+
+		log.Printf("New alert: %s — %s", alert.Title, strings.Join(alert.Data, ", "))
+		for _, sub := range store.All() {
+			go broadcast(sub, alert)
 		}
 	}
 }
 
-func (p *AlertPoller) fetchAlerts() ([]OrefAlert, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest("GET", orefAlertsURL, nil)
-	if err != nil {
-		return nil, err
+func (p *AlertPoller) toOrefAlert(raw tzevaadomMsg) OrefAlert {
+	return OrefAlert{
+		ID:    fmt.Sprintf("%s-%d", raw.Time, raw.Threat),
+		Cat:   fmt.Sprintf("%d", raw.Threat),
+		Title: threatTitle(raw.Threat),
+		Data:  raw.Cities,
+		Desc:  threatDesc(raw.Threat),
 	}
-	req.Header.Set("Referer", "https://www.oref.org.il/")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Accept", "application/json")
+}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+func threatTitle(threat int) string {
+	switch threat {
+	case 1:
+		return "ירי רקטות וטילים"
+	case 2:
+		return "חדירת כלי טיס עוין"
+	case 3:
+		return "רעידת אדמה"
+	case 4:
+		return "חשש לחדירת מחבלים"
+	case 5:
+		return "חומרים מסוכנים"
+	case 6:
+		return "התרעה בטחונית"
+	case 13:
+		return "ירי רקטות וטילים" // pre-alert
+	default:
+		return "התרעה"
 	}
-	defer resp.Body.Close()
+}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+func threatDesc(threat int) string {
+	switch threat {
+	case 1, 13:
+		return "היכנסו למרחב המוגן ושהו בו 10 דקות"
+	case 2:
+		return "היכנסו למרחב המוגן ושהו בו 10 דקות"
+	case 4:
+		return "היכנסו למבנה, נעלו את הדלת ועצרו את הכניסה"
+	default:
+		return "פעלו לפי הנחיות פיקוד העורף"
 	}
-
-	trimmed := strings.TrimSpace(string(body))
-	if trimmed == "" {
-		return nil, nil
-	}
-
-	var alert OrefAlert
-	if err := json.Unmarshal([]byte(trimmed), &alert); err != nil {
-		return nil, err
-	}
-	if alert.ID == "" {
-		return nil, nil
-	}
-	return []OrefAlert{alert}, nil
 }
 
 func (p *AlertPoller) isDuplicate(id string) bool {
@@ -109,6 +157,15 @@ func (p *AlertPoller) markSeen(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.seen[id] = time.Now()
+	// cleanup old entries
+	if len(p.seen) > 500 {
+		cutoff := time.Now().Add(-1 * time.Hour)
+		for k, t := range p.seen {
+			if t.Before(cutoff) {
+				delete(p.seen, k)
+			}
+		}
+	}
 }
 
 func (p *AlertPoller) storeRecent(alert OrefAlert) {
@@ -133,17 +190,6 @@ func (p *AlertPoller) History() []OrefAlert {
 		}
 	}
 	return result
-}
-
-func (p *AlertPoller) cleanupSeen() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
-	for id, t := range p.seen {
-		if now.Sub(t) > dedupTTL {
-			delete(p.seen, id)
-		}
-	}
 }
 
 func (p *AlertPoller) RecentAlerts() []OrefAlert {
@@ -197,9 +243,24 @@ func buildMessage(sub *Subscriber, alert OrefAlert, areas []string, inEnglish bo
 	}
 
 	if inEnglish {
-		return fmt.Sprintf("%s\n*Missile/Rocket Alert*\nAreas: %s\nEnter a protected space and remain for 10 minutes.", prefix, areaStr)
+		return fmt.Sprintf("%s\n*%s*\nAreas: %s\n%s", prefix, threatTitleEn(alert.Cat), areaStr, alert.Desc)
 	}
-	return fmt.Sprintf("%s *התראה*\n*%s*\nאזורים: %s\n%s", prefix, alert.Title, areaStr, alert.Desc)
+	return fmt.Sprintf("%s *%s*\nאזורים: %s\n%s", prefix, alert.Title, areaStr, alert.Desc)
+}
+
+func threatTitleEn(cat string) string {
+	switch cat {
+	case "1", "13":
+		return "Missile/Rocket Alert"
+	case "2":
+		return "Hostile Aircraft Infiltration"
+	case "4":
+		return "Terrorist Infiltration"
+	case "5":
+		return "Hazardous Materials"
+	default:
+		return "Security Alert"
+	}
 }
 
 func translateAreas(areas []string) ([]string, error) {
